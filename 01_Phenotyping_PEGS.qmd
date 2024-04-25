@@ -1,0 +1,477 @@
+---
+title: "Phenotyping autoimmune diseases and cardiometabolic disorders of pregnancy in PEGS"
+author: "Jasmine A. Mack"
+format: html
+editor: visual
+jupyter: python3
+---
+
+```{r}
+library(data.table)
+library(dplyr)
+library(librarian)
+librarian::shelf(data.table, naniar, tidyverse, wrapr)
+library(VennDiagram)
+library(tableone)
+```
+
+```{r}
+#Let's load in the data sets now.
+setwd("Z:/")
+setwd("/ddn/gs1/project/controlled/PEGS/")
+#load in map data: epr.bcbb.map and epr.bcbb.map.meta
+load("Data_Freezes/freeze_v3.1/Map/bcbb_map_22jun22_v3.1.RData")
+
+#load in health and exposure survey data: epr.he and epr.he.meta
+load("Data_Freezes/freeze_v3.1/Surveys/Health_and_Exposure/healthexposure_16jun22_v3.1.RData")
+
+#load in exposome survey part a data: epr.ea and epr.ea.meta
+load("Data_Freezes/freeze_v3.1/Surveys/Exposome/exposomea_29jul22_v3.1.RData")
+
+#load in exposome survey part b data: epr.eb and epr.eb.meta
+load("Data_Freezes/freeze_v3.1/Surveys/Exposome/exposomeb_29jul22_v3.1.RData")
+
+
+```
+
+This set of code below is from Dr. Farida Akhtari's [Github](https://github.com/fsakhtari/PEGS_common/blob/master/pegs_common_utils.R). We have both the data set and the metadata for each data type. The following takes care of necessary variable transformation for usability.
+
+```{r}
+### Common constants ###
+
+# special codes
+PEGS_SP_CODES <- c(
+  ".M", ".S", ".N",
+  c(seq(-111111, -999999, by = -111111))
+)
+
+#' PEGS data converter
+#'
+#' Convert columns in the PEGS data frame to appropriate variable types as
+#' specified in the metadata file. All special codes are converted to NA.
+#'
+#' @param pegs_df The PEGS dataframe to convert
+#' @param pegs_df_meta The accompanying PEGS metadata dataframe
+#' @param quiet do not report conversion progress (def=TRUE)
+#' @return The converted PEGS dataframe
+pegs_convert_type <- function(pegs_df, pegs_df_meta, quiet=TRUE)
+{
+    ## list for converters, add character="identity"
+    CONVERTERS <- c(binary=as.factor, factor=as.factor, numeric=as.numeric,
+                    `ordered factor`=as.factor, date=as.Date, character=identity)
+    ## set NA
+    pegs_df <- as.matrix(pegs_df)
+    pegs_df[pegs_df %in% PEGS_SP_CODES] <- NA
+    pegs_df <- as.data.frame(pegs_df)
+    
+    ## convert to R types
+    ## look up the meta-data long variable names with table headers, gets true class
+    true_class <- with(pegs_df_meta,
+                       true_class[match(names(pegs_df), long_variable_name)])
+    ## look up the list of converter with true classes, gets converters
+    converters <- CONVERTERS[true_class]
+    for(i in seq_along(pegs_df))
+    {
+        pegs_df[[i]] <- converters[[i]](pegs_df[[i]])
+        if(!quiet)
+            cat(sprintf("%4i %-40s %16s -> %s\n",
+                        i, names(pegs_df)[i], true_class[i], class(pegs_df[[i]])))
+    }
+    return(pegs_df)
+    
+}
+```
+
+```{r}
+#Applying the function
+
+#Use function to convert variable types
+
+pegs.bcbb.map.conv0<-pegs_convert_type(epr.bcbb.map, epr.bcbb.map.meta)
+pegs.he.conv0<-pegs_convert_type(epr.he, epr.he.meta)
+pegs.ea.conv0<-pegs_convert_type(epr.ea,epr.ea.meta)
+pegs.eb.conv0<-pegs_convert_type(epr.eb,epr.eb.meta)
+
+#pegs.gis<-pegs_convert_type(epr.gis,epr.gis.meta)
+#pegs.earthdata<-pegs_convert_type(epr.earthdata,epr.earthdata.meta)
+#pegs.svi<-pegs_convert_type(epr.svi,epr.svi.meta)
+#pegs.hazards<-pegs_convert_type(epr.hazards,epr.hazards.meta)
+#pegs.eji<-pegs_convert_type(epr.eji,epr.eji.meta)
+
+#Merge four sets together
+exp0<-merge(epr.bcbb.map.conv0,epr.he.conv0, by = "epr_number", all=T)
+exp1<-merge(exp0, epr.ea.conv0, by = "epr_number", all=T)
+exp<-merge(exp1, epr.eb.conv0, by = "epr_number", all=T)
+
+##Check merge
+exp0<-merge(epr.bcbb.map,epr.he, by = "epr_number", all=T)
+exp1<-merge(exp0, epr.ea, by = "epr_number", all=T)
+exp<-merge(exp1, epr.eb, by = "epr_number",all=T)
+
+save(exp, file="W:/PEGS/Datasets/PEGS_merged.Rdata")
+
+#Follow-up question - should the geospatial files be narrowed down to addresses at enrollment?
+```
+
+### Defining pregnancy cohort
+
+-   The PEGS surveys (specifically he and eb) ask about pregnancy status and history
+
+    ```{r}
+    load("W:/PEGS/Datasets/PEGS_merged.Rdata")
+    load("/ddn/gs1/home/mackja/PEGS/Datasets/PEGS_merged.Rdata")
+
+    exp<-exp %>%
+      mutate(preg_status=case_when(
+        he_m086_pregnant_PARQ == 1 |
+          eb_m313_ever_pregnant_PARQ == 1 ~ 1,
+        TRUE ~ 0
+      ))
+
+    table(exp$preg_status) #n - 4,942
+    table(exp$preg_status, exp$sex_derived,exclude=F) #There is one person who reported a pregnancy, but they are missing sex variable - will impute sex as female
+
+    ```
+
+    ```{r}
+    preg_cohort<-filter(exp, preg_status==1)
+    preg_cohort$sex_derived = 1
+
+
+
+    #Converting pregnancy complication variables to numeric
+    #Note: not considering a "late" due date as a complication
+
+    preg_variables<-c("he_b007a_hypertension_preg_CHILDQ",
+                      "eb_m316_hypertension_preg_CHILDQ",
+                      "he_c022a_diabetes_preg_CHILDQ",
+                      "eb_m318_diabetes_preg_CHILDQ",
+                      "eb_m317_preeclampsia_preg_CHILDQ",
+                      "eb_m319_placenta_prob_preg_CHILDQ",
+                      "eb_m320_poor_growth_preg_CHILDQ",
+                      "eb_m321_other_comp_preg_CHILDQ",
+                      "eb_m325_baby_le5lbs_derived1a" ,
+                      "eb_m325_baby_gt9lbs_derived1c",
+                      "eb_m326_baby_early_derived1a"
+                      
+                      )
+
+    i <- preg_variables
+    preg_cohort[,i] <- apply(preg_cohort[,i], 2,    
+                             function(x) as.numeric(x))
+    ```
+
+#### Defining Controls
+
+-   For any APO in PEGS, we define one control set to be used for each for consistency.
+
+-   Controls: did not report any pregnancy complications, but includes participants who are **missing** exposome (eb) data.
+
+-   If APO_status = 0, pregnant without complication (control)
+
+-   There are **1,126** participants that reported at least one pregnancy complication.
+
+    ```{r}
+    preg_cohort<-preg_cohort %>%
+      mutate(APO_status = case_when(
+        he_b007a_hypertension_preg_CHILDQ == 1 |
+          eb_m316_hypertension_preg_CHILDQ == 1 |
+          he_c022a_diabetes_preg_CHILDQ == 1 |
+          eb_m318_diabetes_preg_CHILDQ == 1 |
+          eb_m317_preeclampsia_preg_CHILDQ == 1 |
+          eb_m319_placenta_prob_preg_CHILDQ == 1 |
+          eb_m320_poor_growth_preg_CHILDQ == 1 |
+          eb_m321_other_comp_preg_CHILDQ == 1 |
+          eb_m325_baby_le5lbs_derived1a == 1 |
+          eb_m325_baby_gt9lbs_derived1c == 1 |
+          eb_m326_baby_early_derived1a == 1 ~ 1,
+        TRUE ~ 0
+      ))
+
+    table(preg_cohort$APO_status)
+    ```
+
+    #### Defining APOs
+
+    ```{r}
+    preg_cohort<-preg_cohort %>%
+      mutate(
+
+    ##
+    #Hypertension during pregnancy
+    ##
+
+    #Gestational Hypertension
+      GH = case_when(he_b007a_hypertension_preg_CHILDQ == 1 |
+                                    eb_m316_hypertension_preg_CHILDQ == 1 ~ 1,
+                                    APO_status == 0 ~ 0),
+      
+      
+    #Preeclampsia
+
+     PE = case_when(eb_m317_preeclampsia_preg_CHILDQ == 1 ~ 1,
+                    APO_status == 0 ~ 0),
+      
+    #Gestational Hypertension or Preeclampsia/Toxemia
+      HDP = case_when(
+        he_b007a_hypertension_preg_CHILDQ == 1 |
+          eb_m316_hypertension_preg_CHILDQ == 1 |
+          eb_m317_preeclampsia_preg_CHILDQ == 1 ~ 1,
+        APO_status == 0 ~ 0),
+
+      
+    )
+    ```
+
+```{r}
+##ALSO DEFINE THE FETAL CHARACTERISTICS (I.E. SOMEONE REPORTS BEING A PRETERM BABY)
+
+#To limit to those with wGS data
+#exp1<-filter(exp, broad_wgs_PARQ==1)
+
+#preg_cohort_he<-dplyr::filter(preg_cohort,he_complete == 1)
+
+#Let's merge the preg_cohort with exp
+
+#Gravidity: eb_m315_number_pregnancies_CHILDQ and he_m086a_pregnant_num_CHILDQ
+
+preg_cohort$eb_m315_number_pregnancies_CHILDQ<-as.numeric(preg_cohort$eb_m315_number_pregnancies_CHILDQ)
+preg_cohort$he_m086a_pregnant_num_CHILDQ<-as.numeric(preg_cohort$he_m086a_pregnant_num_CHILDQ)
+
+preg_cohort<-preg_cohort %>% 
+  mutate( Gravidity = case_when(eb_m315_number_pregnancies_CHILDQ >= he_m086a_pregnant_num_CHILDQ | is.na(he_m086a_pregnant_num_CHILDQ) ~ eb_m315_number_pregnancies_CHILDQ,
+                          he_m086a_pregnant_num_CHILDQ >= eb_m315_number_pregnancies_CHILDQ | is.na(eb_m315_number_pregnancies_CHILDQ) ~ he_m086a_pregnant_num_CHILDQ
+    ))
+
+preg_cohort<-preg_cohort %>% mutate(Gravidity = 
+                                      case_when(Gravidity == 1 ~ "1", 
+                                                Gravidity == 2 ~ "2", 
+                                                Gravidity == 3 ~ "3", 
+                                                Gravidity == 4 ~ "4", 
+                                                Gravidity >= 5 ~ "5+" ))
+
+
+preg_cohort1<-preg_cohort[,c(1,9,222,1813,1816,1818,1820,1930:1941)] 
+exp1<-exp[,c(1,3,9:11,32:34,68,102,1932:1945)]
+
+exp_merged<-merge(preg_cohort1, exp1,by="epr_number",all=T)
+
+
+```
+
+### Defining Covariates
+
+```{r}
+exp_merged$sex_derived.y<-as.numeric(exp_merged$sex_derived.y)
+
+exp_merged$sex<-exp_merged$sex_derived.y
+
+
+exp_merged$sex_update<-ifelse(exp_merged$preg_status==1 & is.na(exp_merged$sex),2,exp_merged$sex)
+
+table(exp_merged$sex_update,exp_merged$preg_status,exclude=F)
+
+#For the sex, 2 = female, 1 = male
+
+#Race - 1, AI/AN
+#Race - 2, Asian
+#Race - 3, Black
+#Race - 4, NH/PI
+#Race - 5, White
+#Race - 6, Multiple
+
+#exp_merged$re_cat[is.na(exp_merged$race) | is.na(exp_merged$ethnicity)] = "Unk"
+#exp_merged$re_cat[exp_merged$ethnicity==1] = "Hispanic"
+
+exp_merged$re_cat<-"NONE"
+exp_merged$re_cat[exp_merged$race==3 & (exp_merged$ethnicity==0 | is.na(exp_merged$ethnicity))] = "Black"
+exp_merged$re_cat[exp_merged$race==5 & (exp_merged$ethnicity==0 | is.na(exp_merged$ethnicity))] = "White"
+exp_merged$re_cat[(exp_merged$race==1 | exp_merged$race==2 | exp_merged$race==4 | exp_merged$race==6)| (is.na(exp_merged$race) & is.na(exp_merged$ethnicity)) | exp_merged$ethnicity==1 | exp_merged$re_cat == "NONE" ] = "Other"
+
+```
+
+```{r}
+table(exp_merged$broad_wgs_PARQ) #n = 4737
+
+exp_gen<-dplyr::filter(exp_merged,broad_wgs_PARQ==1)
+
+
+#Match to genome dataset: n = 130 removed (120 by relatedness, 4 by sex aneuploidy, 3 by contamination, 3 shown to be duplicates)
+fam<-fread("/ddn/gs1/project/nextgen/controlled/wgsepr/Contolled/plink/simple_id_ref_alt_order/PEGS_GWAS_genotypes_v1.1.fam")
+
+fam<-fam[,c(1,2)]
+colnames(fam)<-c("#FID","IID")
+
+#X:\Contolled\plink\simple_id_ref_alt_order\correct_XY
+#check_dups<-dplyr::filter(exp_gen,epr_number %in% c(302770, 302956, 102463, 306258, 308074, 305209))
+
+#n = 4607
+exp_gen_filtered<-merge(fam,exp_gen,by.x="#FID",by.y="epr_number",all.x=T)
+
+exp_gen_filtered<-dplyr::rename(exp_gen_filtered, Sex=sex_update, Age=enrollment_age_derived,BMI=he_bmi_derived)
+```
+
+```{r}
+##RECODING
+
+exp_gen_filtered<-exp_gen_filtered %>% mutate(Gravidity = case_when(Gravidity == "1" ~ "one" , 
+                                                Gravidity == "2" ~ "two", 
+                                                Gravidity == "3" ~ "three", 
+                                                Gravidity == "4"  ~ "four", 
+                                                Gravidity == "5+" ~ "five+",
+                                                TRUE ~ "NONE" ))
+
+save(exp_gen_filtered,file="/ddn/gs1/home/mackja/PEGS/Datasets/PEGS_AiDs_APOs_Genomics.RData")
+```
+
+```{r}
+#Prepare the files
+
+IIDs<-c("#FID","IID")
+
+APO_Covs<-c("Sex","Age","BMI","re_cat","Gravidity","APO_status")
+
+#"APO_status",
+APO_pheno<-c("GH","HDP","PE")
+
+
+#Loop through each phenotype
+for (pheno in APO_pheno) {
+  
+  cols=c(IIDs,pheno,APO_Covs)
+  
+  # Print the current phenotype being processed
+  cat("Creating dataset for phenotype:", pheno, "\n")
+  
+  # Extract columns from exp_gen_filtered for the current phenotype
+     data <-exp_gen_filtered[,..cols,with=FALSE]
+     data<-data[!is.na(get(pheno))]
+     
+    assign(paste("APO_", pheno, sep = ""),data,envir=.GlobalEnv)
+}
+
+
+load("/ddn/gs1/home/mackja/PEGS/Datasets/PEGS_AiDs_APOs_Genomics.RData")
+
+load("/ddn/gs1/home/mackja/PEGS/Datasets/PEGS_AiDs_APOs_25Mar2024.RData")
+
+load("/ddn/gs1/home/mackja/PEGS/Datasets/PEGS_merged.Rdata")
+
+```
+
+```{r}
+# Loop through each dataset
+for (i in Datasets) {
+  # Extract the first two columns
+  current_data <- mget(i)[[1]][, 1:2, with = FALSE]
+  
+  # Define the filename
+  filename <- paste("IDs","_", i, ".txt", sep = "")
+  
+  # Write the data to a text file
+  fwrite(current_data, filename, sep = "\t", row.names = FALSE, col.names = FALSE)
+  
+}
+
+```
+
+### Computing PCs
+
+```{r}
+library(SNPRelate)
+library(GWASTools)
+library(GENESIS)
+library(plyr)
+
+#ENSURE THAT YOU ARE KEEPING BIOCONDUCTOR UPDATED
+#https://www.bioconductor.org/install/
+```
+
+```{r}
+
+snpgdsBED2GDS(bed.fn = "/ddn/gs1/project/nextgen/controlled/wgsepr/Contolled/plink/simple_id_ref_alt_order/PEGS_GWAS_genotypes_v1.1.bed",
+              bim.fn = "/ddn/gs1/project/nextgen/controlled/wgsepr/Contolled/plink/simple_id_ref_alt_order/PEGS_GWAS_genotypes_v1.1.bim",
+             fam.fn = "/ddn/gs1/project/nextgen/controlled/wgsepr/Contolled/plink/simple_id_ref_alt_order/PEGS_GWAS_genotypes_v1.1.fam",
+           out.gdsfn = "PEGS_GWAS_v1.1.gds")
+
+#Check the number of non-autosomes..
+bim<-fread("/ddn/gs1/project/nextgen/controlled/wgsepr/Contolled/plink/simple_id_ref_alt_order/PEGS_GWAS_genotypes_v1.1.bim")
+
+#gds<-snpgdsOpen("PEGS_GWAS_v1.1.gds")
+
+#snpset <- snpgdsLDpruning(gds, method="corr", slide.max.bp=50e5, num.thread=50,
+#                ld.threshold=sqrt(0.1), verbose=FALSE, maf=.05,missing.rate=.05)
+
+#save(snpset, file="/ddn/gs1/home/mackja/PEGS/Datasets/LDPruned_SNPs_v1.1.RData")
+
+load("/ddn/gs1/home/mackja/PEGS/Datasets/LDPruned_SNPs_v1.1.RData")
+pruned <- unlist(snpset, use.names=FALSE)
+length(pruned) #233,910
+```
+
+```{r}
+
+setwd("/ddn/gs1/group/AMR/mackja/AiDs_APOs/Datasets")
+#Reading in Rdata files before running the functionc
+file_names=as.list(dir(pattern=".Rdata*"))
+lapply(file_names, load, environment())
+
+
+Compute_PCs<-function(prefix,pheno,name) {
+  
+gds<-snpgdsOpen("PEGS_GWAS_v1.1.gds")
+
+#name<-deparse(substitute(pheno))
+
+ID_file<-(paste0("IDs_",name,".txt")) #or name!! if running as func
+IDs<-fread(ID_file)[[2]]
+
+#print(ID_file)
+
+KINGmat<-snpgdsIBDKING(gds,sample.id=IDs,num.thread=100) #5min
+snpgdsClose(gds)
+KINGmat1<-kingToMatrix(KINGmat)
+
+geno <- GdsGenotypeReader(filename = "PEGS_GWAS_v1.1.gds")
+genoData <- GenotypeData(geno)
+
+
+load("/ddn/gs1/home/mackja/PEGS/Datasets/LDPruned_SNPs_v1.1.RData")
+pruned <- unlist(snpset, use.names=FALSE)
+
+mypcair <- pcair(genoData, kinobj = KINGmat1 ,divobj = KINGmat1, snp.include = pruned,sample.include=IDs,num.cores = 100)
+
+PCs<-as.data.frame(mypcair$vectors)
+
+PCs <- cbind(rownames(PCs),PCs)
+rownames(PCs) <- NULL
+colnames(PCs) <- c(names(PCs)) #to not write all the column names
+colnames(PCs)[1] <- "IID" 
+names(PCs)
+
+
+dim(pheno)
+
+dim(PCs)
+
+PCs<-PCs[,1:11]
+pheno_plink<-join(pheno, PCs)
+
+# Specify the columns for which you want to remove rows with missing values
+columns_to_check <- c("Sex", "Age", "V1")
+
+# Use na.omit to remove rows with missing values in specified columns
+filtered_data <- pheno_plink[complete.cases(pheno_plink[, ..columns_to_check, drop = FALSE]), ]
+
+fwrite(filtered_data,paste0(prefix,".txt"), sep="\t" ,na=NA,quote=F)
+
+
+showfile.gds(closeall=TRUE)
+}
+
+
+Compute_PCs("GH",APO_GH)
+Compute_PCs("HDP",APO_HDP)
+Compute_PCs("PE",APO_PE)
+
+```
